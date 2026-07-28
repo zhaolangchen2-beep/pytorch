@@ -127,6 +127,74 @@ num_guards_executed=0)
         self.assertFalse(const_guard(4))
         self.assertFalse(const_guard("foo"))
 
+    @unittest.skipIf(
+        sysconfig.get_config_var("Py_GIL_DISABLED") == 1,
+        "requires the GIL",
+    )
+    def test_root_guard_manager_contended_check_releases_gil(self):
+        script = """
+            import sys
+            import threading
+
+            from torch._C._dynamo import guards
+
+            # Keep the contender running from Event.set() into the C++ check.
+            sys.setswitchinterval(60.0)
+            root = guards.RootGuardManager()
+            holder_ident = [None]
+            holder_has_lock = threading.Event()
+            contender_calling = threading.Event()
+            release_holder = threading.Event()
+            results = {}
+            errors = []
+
+            def blocking_guard(_value):
+                if threading.get_ident() == holder_ident[0]:
+                    holder_has_lock.set()
+                    # Release the GIL while keeping the root mutex held.
+                    if not release_holder.wait(timeout=5):
+                        raise RuntimeError("holder release timed out")
+                return True
+
+            root.add_lambda_guard(blocking_guard, ["blocking root guard"])
+
+            def run_holder():
+                try:
+                    holder_ident[0] = threading.get_ident()
+                    results["holder"] = root.check(None)
+                except BaseException as exc:
+                    errors.append(f"holder: {exc!r}")
+
+            def run_contender():
+                try:
+                    contender_calling.set()
+                    results["contender"] = root.check(None)
+                except BaseException as exc:
+                    errors.append(f"contender: {exc!r}")
+
+            holder = threading.Thread(target=run_holder)
+            contender = threading.Thread(target=run_contender)
+            holder.start()
+            assert holder_has_lock.wait(timeout=5), "holder did not enter guard"
+
+            contender.start()
+            assert contender_calling.wait(timeout=5), "contender did not start"
+            release_holder.set()
+
+            holder.join(timeout=5)
+            contender.join(timeout=5)
+            assert not holder.is_alive(), "holder thread did not finish"
+            assert not contender.is_alive(), "contender thread did not finish"
+            assert not errors, errors
+            assert results == {"holder": True, "contender": True}, results
+        """
+        subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            cwd=os.getcwd(),
+            check=True,
+            timeout=30,
+        )
+
     def test_type_guard(self):
         root = RootGuardManager()
         foo = 4
@@ -2077,6 +2145,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
     def test_actual_partial_preserves_tensor_no_hasattr_guard(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             GLOBAL_DICT = {"used": 1, "noise": [0]}
@@ -2085,6 +2154,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 def __init__(self):
                     super().__init__()
                     self._cached_tensor = torch.ones(2)
+                    self._cached_tensor.__dict__["safe_marker"] = None
 
                 def forward(self, x):
                     return self._cached_tensor + x + GLOBAL_DICT["used"]
@@ -2101,10 +2171,59 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
             assert counter.frame_count == 1, counter.frame_count
 
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
             model._cached_tensor._dynamo_dynamic_indices = set()
             GLOBAL_DICT["noise"] = [100]
             torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
             assert counter.frame_count == 2, counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_rejects_effectful_tensor_dict_keys(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class CollidingKey:
+                calls = 0
+
+                def __hash__(self):
+                    return hash("_dynamo_dynamic_indices")
+
+                def __eq__(self, other):
+                    type(self).calls += 1
+                    return False
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._cached_tensor = torch.ones(2)
+                    self._cached_tensor.__dict__[CollidingKey()] = None
+
+                def forward(self, x):
+                    return self._cached_tensor + x + GLOBAL_DICT["used"]
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(
+                model, backend=counter, fullgraph=True, dynamic=True
+            )
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert not entries[0]._debug_fast_guard_enabled
+            assert CollidingKey.calls > 0, CollidingKey.calls
         """
         self._run_fast_plan_script(script)
 
@@ -2274,7 +2393,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
-    def test_actual_partial_rejects_oversized_list_snapshots(self):
+    def test_actual_partial_rejects_oversized_container_snapshots(self):
         script = """
             import torch
             from torch._dynamo.eval_frame import _debug_get_cache_entry_list
@@ -2283,14 +2402,19 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             class Model(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
-                    self.left = [1.0] * 32769
-                    self.right = [1.0] * 32769
+                    self.values = [1.0] * 32769
+                    self._cached_tensor = torch.ones(2)
+                    self._cached_tensor.__dict__.update(
+                        {f"safe_{i}": None for i in range(32768)}
+                    )
 
                 def forward(self, x):
-                    return x + self.left[0] + self.right[0]
+                    return x + self.values[0] + self._cached_tensor
 
             counter = CompileCounter()
-            compiled = torch.compile(Model(), backend=counter, fullgraph=True)
+            compiled = torch.compile(
+                Model(), backend=counter, fullgraph=True, dynamic=True
+            )
             x = torch.zeros(2)
             for _ in range(4):
                 torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))

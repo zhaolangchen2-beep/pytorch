@@ -200,7 +200,7 @@ void lookup(
     ++index;
   }
   if (found) {
-    if (use_lru) {
+    if (use_lru && found != extra_state->get_first_entry()) {
       extra_state->move_to_front(found);
     }
     *maybe_cached_code = found->code.ptr();
