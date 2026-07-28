@@ -2231,6 +2231,129 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
+    def test_actual_partial_detects_dynamic_getattribute_install(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.scale = 1.0
+
+                def __getattr__(self, name):
+                    return super().__getattr__(name)
+
+                def forward(self, x):
+                    return x + self.scale
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for _ in range(8):
+                torch.testing.assert_close(compiled(x), torch.ones(2))
+            assert counter.frame_count == 1, counter.frame_count
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            def custom_getattribute(self, name):
+                if name == "scale":
+                    return 5.0
+                return object.__getattribute__(self, name)
+
+            Model.__getattribute__ = custom_getattribute
+            try:
+                torch.testing.assert_close(compiled(x), torch.full((2,), 5.0))
+                assert counter.frame_count == 2, counter.frame_count
+            finally:
+                del Model.__getattribute__
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_rejects_oversized_list_snapshots(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.left = [1.0] * 32769
+                    self.right = [1.0] * 32769
+
+                def forward(self, x):
+                    return x + self.left[0] + self.right[0]
+
+            counter = CompileCounter()
+            compiled = torch.compile(Model(), backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for _ in range(4):
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert not entries[0]._debug_fast_guard_enabled
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_token_miss_runs_root_guards_once(self):
+        script = """
+            import torch
+            import torch._dynamo.guards as dynamo_guards
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            ROOT_GUARD_CALLS = 0
+
+            def count_root_guard(_f_locals):
+                global ROOT_GUARD_CALLS
+                ROOT_GUARD_CALLS += 1
+                return True
+
+            def inject_root_guard(guard_wrapper, _f_locals, _builder):
+                guard_wrapper.root.add_lambda_guard(
+                    count_root_guard, ["count root guard calls"]
+                )
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.values = [1.0]
+
+                def forward(self, x):
+                    return x + self.values[0]
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+
+            old_hook = dynamo_guards.guard_manager_testing_hook_fn
+            dynamo_guards.guard_manager_testing_hook_fn = inject_root_guard
+            try:
+                for _ in range(8):
+                    torch.testing.assert_close(compiled(x), torch.ones(2))
+            finally:
+                dynamo_guards.guard_manager_testing_hook_fn = old_hook
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            ROOT_GUARD_CALLS = 0
+            model.values = [1.0]
+            torch.testing.assert_close(compiled(x), torch.ones(2))
+            assert counter.frame_count == 1, counter.frame_count
+            assert ROOT_GUARD_CALLS == 1, ROOT_GUARD_CALLS
+        """
+        self._run_fast_plan_script(script)
+
     def test_actual_partial_retains_compiled_self_lifetime(self):
         script = """
             import gc
