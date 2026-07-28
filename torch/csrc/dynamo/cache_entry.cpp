@@ -4,6 +4,8 @@
 #include <torch/csrc/dynamo/debug_macros.h>
 #include <torch/csrc/dynamo/extra_state.h>
 
+#include <utility>
+
 CacheEntry::CacheEntry(const py::handle& guarded_code, PyObject* backend)
     : backend{py::cast<py::object>(get_backend(backend))} {
   this->guard_manager = guarded_code.attr("guard_manager");
@@ -29,11 +31,13 @@ C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED(
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wdeprecated-copy-dtor")
 // NOLINTNEXTLINE(bugprone-exception-escape)
 CacheEntry::~CacheEntry() {
-  torch::dynamo::destroy_guard_last_success_receipt(
-      this->last_success_receipt);
+  void* receipt = std::exchange(this->last_success_receipt, nullptr);
+  this->root_mgr = nullptr;
+  this->diff_guard_root_mgr = nullptr;
   // prevent guard_manager from use-after-free when invalidating
   this->guard_manager.attr("cache_entry") = py::none();
   this->guard_manager.attr("extra_state") = py::none();
+  torch::dynamo::destroy_guard_last_success_receipt(receipt);
 }
 C10_DIAGNOSTIC_POP()
 C10_DIAGNOSTIC_POP()
@@ -50,15 +54,16 @@ py::object CacheEntry::next() {
 
 void CacheEntry::invalidate(py::object deleted_guard_manager) {
   // Keep the current pointer alive but make the fields as if no-op
+  void* receipt = std::exchange(this->last_success_receipt, nullptr);
+  this->root_mgr = nullptr;
+  this->diff_guard_root_mgr = nullptr;
   this->guard_manager.attr("cache_entry") = py::none();
   this->guard_manager.attr("extra_state") = py::none();
   this->code = py::none();
   this->guard_manager = std::move(deleted_guard_manager);
-  torch::dynamo::reset_guard_last_success_receipt(
-      this->last_success_receipt);
-  this->root_mgr = nullptr;
   this->trace_annotation = "Invalidated";
   this->backend = py::none();
+  torch::dynamo::destroy_guard_last_success_receipt(receipt);
 }
 
 void CacheEntry::update_diff_guard_root_manager() {

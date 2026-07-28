@@ -5,6 +5,7 @@ import inspect
 import os
 import subprocess
 import sys
+import sysconfig
 import textwrap
 import unittest
 import weakref
@@ -1446,6 +1447,10 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
                 opt_fn(x)
 
 
+@unittest.skipIf(
+    sysconfig.get_config_var("Py_GIL_DISABLED") == 1,
+    "fast guard plans require the GIL",
+)
 class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
     @staticmethod
     def _run_fast_plan_script(script):
@@ -1461,6 +1466,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
     def test_actual_partial_preserves_module_and_residual_guards(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             global_bias = torch.tensor(3.0)
@@ -1470,9 +1476,15 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                     super().__init__()
                     self.register_buffer("scale", torch.tensor(2.0))
                     self.offsets = [1.0]
+                    self.values = (0.0,)
 
                 def forward(self, x):
-                    return x * self.scale + self.offsets[0] + global_bias
+                    return (
+                        x * self.scale
+                        + self.offsets[0]
+                        + self.values[0]
+                        + global_bias
+                    )
 
             model = Model()
             counter = CompileCounter()
@@ -1484,6 +1496,13 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             for _ in range(8):
                 torch.testing.assert_close(compiled(x), model(x))
             assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            model.values = (2.0,)
+            torch.testing.assert_close(compiled(x), model(x))
+            assert counter.frame_count == 2, counter.frame_count
 
             model.scale = torch.tensor(4.0)
             torch.testing.assert_close(compiled(x), model(x))
@@ -1500,17 +1519,182 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             model.scale = torch.tensor(6.0)
             x = torch.ones(9)
             torch.testing.assert_close(compiled(x), model(x))
+        """
+        self._run_fast_plan_script(script)
 
-            def alias_sensitive(a, b):
-                return a + b if a is b else a - b
+    def test_actual_partial_preserves_root_special_guards(self):
+        script = """
+            import torch
+            import torch.utils._device as utils_device
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+            from torch.overrides import BaseTorchFunctionMode
 
-            compiled_alias = torch.compile(
-                alias_sensitive, backend="eager", fullgraph=True
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.bias = 2.0
+
+                def forward(self, x):
+                    return x + self.bias + GLOBAL_DICT["used"]
+
+            counter = CompileCounter()
+            compiled = torch.compile(Model(), backend=counter, fullgraph=True)
+            x = torch.ones(2)
+            expected = torch.full((2,), 4.0)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), expected)
+            assert counter.frame_count == 1, counter.frame_count
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            with torch.no_grad():
+                result = compiled(x)
+            torch.testing.assert_close(result, expected)
+            assert counter.frame_count == 2, counter.frame_count
+
+            previous_device = utils_device.CURRENT_DEVICE
+            try:
+                utils_device.CURRENT_DEVICE = torch.device("cpu")
+                result = compiled(x)
+            finally:
+                utils_device.CURRENT_DEVICE = previous_device
+            torch.testing.assert_close(result, expected)
+            assert counter.frame_count == 3, counter.frame_count
+
+            with BaseTorchFunctionMode():
+                result = compiled(x)
+            torch.testing.assert_close(result, expected)
+            assert counter.frame_count == 4, counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_runtime_gate_rejects_unsupported_paths(self):
+        script = """
+            import torch
+            import torch._dynamo.guards as dynamo_guards
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.source import AttrSource, DictGetItemSource, LocalSource
+            from torch._dynamo.testing import CompileCounter
+
+            torch._dynamo.config.skip_tensor_guards_with_matching_dict_tags = True
+            torch._dynamo.config.use_recursive_dict_tags_for_guards = True
+
+            class Control(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.state = {"bias": 1.0}
+
+                def forward(self, x):
+                    return x + self.state["bias"]
+
+            control_counter = CompileCounter()
+            control = torch.compile(
+                Control(), backend=control_counter, fullgraph=True
             )
-            a = torch.ones(4)
-            b = torch.full((4,), 2.0)
-            torch.testing.assert_close(compiled_alias(a, a), alias_sensitive(a, a))
-            torch.testing.assert_close(compiled_alias(a, b), alias_sensitive(a, b))
+            x = torch.ones(2)
+            for _ in range(8):
+                torch.testing.assert_close(control(x), torch.full((2,), 2.0))
+            control_entries = _debug_get_cache_entry_list(Control.forward.__code__)
+            assert len(control_entries) == 1, len(control_entries)
+            assert control_entries[0]._debug_fast_guard_enabled
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.state = {"bias": 1.0}
+
+                def forward(self, x):
+                    return x + self.state["bias"]
+
+            def inject_unsupported_leaf(guard_wrapper, f_locals, builder):
+                source = DictGetItemSource(
+                    AttrSource(LocalSource("self"), "state"), "bias"
+                )
+                manager = builder.get_guard_manager_from_source(source)
+                manager.add_lambda_guard(
+                    lambda value: True,
+                    ["forced unsupported leaf under dict-tagged self subtree"],
+                )
+
+            old_hook = dynamo_guards.guard_manager_testing_hook_fn
+            dynamo_guards.guard_manager_testing_hook_fn = inject_unsupported_leaf
+            try:
+                counter = CompileCounter()
+                compiled = torch.compile(Model(), backend=counter, fullgraph=True)
+                for _ in range(8):
+                    torch.testing.assert_close(
+                        compiled(x), torch.full((2,), 2.0)
+                    )
+            finally:
+                dynamo_guards.guard_manager_testing_hook_fn = old_hook
+
+            assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert not entries[0]._debug_fast_guard_enabled
+
+            torch._dynamo.config.use_recursive_dict_tags_for_guards = False
+
+            class MutableHash:
+                def __init__(self):
+                    self.value = 1
+
+                def __hash__(self):
+                    return self.value
+
+                def __eq__(self, other):
+                    return self is other
+
+            mutable_key = (MutableHash(),)
+
+            class MutableKeyModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.state = {"bias": 1.0, mutable_key: 2.0}
+
+                def forward(self, x):
+                    return x + self.state["bias"]
+
+            def inject_mutable_key_accessor(guard_wrapper, f_locals, builder):
+                state_source = AttrSource(LocalSource("self"), "state")
+                state_manager = builder.get_guard_manager_from_source(state_source)
+                state_manager.dict_getitem_manager(
+                    mutable_key,
+                    "L['self'].state[mutable_key]",
+                    2.0,
+                    dynamo_guards.GuardManagerType.GUARD_MANAGER,
+                ).add_equals_match_guard(2.0, ["mutable key value == 2.0"], True)
+
+            old_hook = dynamo_guards.guard_manager_testing_hook_fn
+            dynamo_guards.guard_manager_testing_hook_fn = (
+                inject_mutable_key_accessor
+            )
+            try:
+                mutable_counter = CompileCounter()
+                mutable_compiled = torch.compile(
+                    MutableKeyModel(),
+                    backend=mutable_counter,
+                    fullgraph=True,
+                )
+                for _ in range(8):
+                    torch.testing.assert_close(
+                        mutable_compiled(x), torch.full((2,), 2.0)
+                    )
+            finally:
+                dynamo_guards.guard_manager_testing_hook_fn = old_hook
+
+            assert mutable_counter.frame_count == 1, mutable_counter.frame_count
+            mutable_entries = _debug_get_cache_entry_list(
+                MutableKeyModel.forward.__code__
+            )
+            assert len(mutable_entries) == 1, len(mutable_entries)
+            assert not mutable_entries[0]._debug_fast_guard_enabled
         """
         self._run_fast_plan_script(script)
 
@@ -1560,6 +1744,209 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             assert all(
                 entry._debug_fast_guard_enabled for entry in original_entries
             ), [entry._debug_fast_guard_enabled for entry in original_entries]
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_reset_publishes_before_finalizer(self):
+        script = """
+            import gc
+            import weakref
+
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            ENTRY = None
+            FINALIZER_STATES = []
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Holder:
+                def __init__(self, value):
+                    self.value = value
+                    self.observe_entry = False
+
+                def __del__(self):
+                    if self.observe_entry:
+                        FINALIZER_STATES.append(
+                            ENTRY._debug_fast_guard_enabled
+                        )
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.holder = Holder(torch.ones(2))
+
+                def forward(self, x):
+                    return self.holder.value + x + GLOBAL_DICT["used"]
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+
+            ENTRY = _debug_get_cache_entry_list(Model.forward.__code__)[0]
+            assert ENTRY._debug_fast_guard_enabled
+
+            with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert not ENTRY._debug_fast_guard_enabled
+
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [100 + i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert ENTRY._debug_fast_guard_enabled
+
+            old_holder = model.holder
+            old_holder.observe_entry = True
+            old_holder_ref = weakref.ref(old_holder)
+            model.holder = Holder(torch.ones(2))
+            del old_holder
+            gc.collect()
+            assert old_holder_ref() is not None
+
+            with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            gc.collect()
+            assert old_holder_ref() is None
+            assert FINALIZER_STATES == [False], FINALIZER_STATES
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_cache_reset_detaches_receipt(self):
+        script = """
+            import gc
+            import weakref
+
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            GUARD_MANAGER = None
+            FINALIZER_STATES = []
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Holder:
+                def __init__(self, value):
+                    self.value = value
+                    self.observe_entry = False
+
+                def __del__(self):
+                    if self.observe_entry:
+                        FINALIZER_STATES.append(
+                            (
+                                GUARD_MANAGER.cache_entry is None,
+                                GUARD_MANAGER.extra_state is None,
+                            )
+                        )
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.holder = Holder(torch.ones(2))
+
+                def forward(self, x):
+                    return self.holder.value + x + GLOBAL_DICT["used"]
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+
+            entry = _debug_get_cache_entry_list(Model.forward.__code__)[0]
+            assert entry._debug_fast_guard_enabled
+            GUARD_MANAGER = entry.guard_manager
+
+            old_holder = model.holder
+            old_holder.observe_entry = True
+            old_holder_ref = weakref.ref(old_holder)
+            model.holder = Holder(torch.full((2,), 3.0))
+            del old_holder
+            gc.collect()
+            assert old_holder_ref() is not None
+
+            entry = None
+            torch._dynamo.reset()
+            gc.collect()
+            assert old_holder_ref() is None
+            assert FINALIZER_STATES == [(True, True)], FINALIZER_STATES
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_invalidation_detaches_receipt(self):
+        script = """
+            import gc
+            import weakref
+
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.guards import DeletedGuardManagerWrapper
+            from torch._dynamo.testing import CompileCounter
+
+            ENTRY = None
+            FINALIZER_STATES = []
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Holder:
+                def __init__(self, value):
+                    self.value = value
+                    self.observe_entry = False
+
+                def __del__(self):
+                    if self.observe_entry:
+                        FINALIZER_STATES.append(
+                            ENTRY._debug_fast_guard_enabled
+                        )
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.holder = Holder(torch.ones(2))
+
+                def forward(self, x):
+                    return self.holder.value + x + GLOBAL_DICT["used"]
+
+            counter = CompileCounter()
+            compiled = torch.compile(
+                Model.forward, backend=counter, fullgraph=True
+            )
+            model = Model()
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(
+                    compiled(model, x), torch.full((2,), 2.0)
+                )
+            assert counter.frame_count == 1, counter.frame_count
+
+            ENTRY = _debug_get_cache_entry_list(Model.forward.__code__)[0]
+            assert ENTRY._debug_fast_guard_enabled
+
+            model_ref = weakref.ref(model)
+            holder_ref = weakref.ref(model.holder)
+            model.holder.observe_entry = True
+            del model
+            gc.collect()
+
+            assert model_ref() is None
+            assert holder_ref() is None
+            assert FINALIZER_STATES == [False], FINALIZER_STATES
+            assert not ENTRY._debug_fast_guard_enabled
+            assert isinstance(ENTRY.guard_manager, DeletedGuardManagerWrapper)
+
+            replacement = Model()
+            GLOBAL_DICT["noise"] = [100]
+            torch.testing.assert_close(
+                compiled(replacement, x), torch.full((2,), 2.0)
+            )
+            assert counter.frame_count == 2, counter.frame_count
         """
         self._run_fast_plan_script(script)
 
@@ -1882,6 +2269,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             import types
 
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             namespace = types.ModuleType("fastguard_test_namespace")
@@ -1935,6 +2323,11 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 torch.testing.assert_close(
                     module_getattr_compiled(x), torch.ones(2)
                 )
+            module_getattr_entries = _debug_get_cache_entry_list(
+                ModuleGetattrModel.forward.__code__
+            )
+            assert len(module_getattr_entries) == 1, len(module_getattr_entries)
+            assert not module_getattr_entries[0]._debug_fast_guard_enabled
 
             dynamic_values[0] = torch.full((2,), 4.0)
             torch.testing.assert_close(
@@ -1965,12 +2358,18 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             )
             for _ in range(8):
                 torch.testing.assert_close(dynamic_compiled(x), torch.ones(2))
+            dynamic_entries = _debug_get_cache_entry_list(
+                DynamicModel.forward.__code__
+            )
+            assert len(dynamic_entries) == 1, len(dynamic_entries)
+            assert not dynamic_entries[0]._debug_fast_guard_enabled
         """
         self._run_fast_plan_script(script)
 
     def test_actual_partial_static_type_attr_binding_proof(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
 
@@ -2022,6 +2421,11 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             )
             for _ in range(8):
                 torch.testing.assert_close(dynamic_compiled(x), torch.ones(2))
+            dynamic_entries = _debug_get_cache_entry_list(
+                DynamicModel.forward.__code__
+            )
+            assert len(dynamic_entries) == 1, len(dynamic_entries)
+            assert not dynamic_entries[0]._debug_fast_guard_enabled
 
             descriptor.value = torch.full((2,), 4.0)
             torch.testing.assert_close(
@@ -2049,12 +2453,18 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             )
             for _ in range(8):
                 torch.testing.assert_close(custom_compiled(x), torch.ones(2))
+            custom_entries = _debug_get_cache_entry_list(
+                CustomModel.forward.__code__
+            )
+            assert len(custom_entries) == 1, len(custom_entries)
+            assert not custom_entries[0]._debug_fast_guard_enabled
         """
         self._run_fast_plan_script(script)
 
-    def test_actual_partial_exact_set_equals_token_detects_mutation(self):
+    def test_actual_partial_exact_set_fails_closed(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             class Model(torch.nn.Module):
@@ -2074,7 +2484,9 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             for _ in range(8):
                 torch.testing.assert_close(compiled(x), torch.ones(2))
             assert counter.frame_count == 1, counter.frame_count
-
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert not entries[0]._debug_fast_guard_enabled
 
             model.mode.add(3)
             torch.testing.assert_close(compiled(x), torch.full((2,), -1.0))
@@ -2353,9 +2765,58 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
-    def test_actual_partial_clears_dynamic_descriptor_exception(self):
+    def test_actual_partial_merges_attr_type_proofs(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.scale = torch.full((2,), 2.0)
+
+                def helper(self, x):
+                    return x + 1
+
+                def forward(self, x):
+                    return self.helper(x) + self.scale + GLOBAL_DICT["used"]
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 4.0))
+            assert counter.frame_count == 1, counter.frame_count
+
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            Model._fastguard_unrelated_type_change = None
+            try:
+                GLOBAL_DICT["noise"] = [100]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 4.0))
+                assert counter.frame_count == 1, counter.frame_count
+                assert entries[0]._debug_fast_guard_enabled
+            finally:
+                del Model._fastguard_unrelated_type_change
+
+            model.scale = torch.full((2,), 3.0)
+            GLOBAL_DICT["noise"] = [101]
+            torch.testing.assert_close(compiled(x), torch.full((2,), 5.0))
+            assert counter.frame_count == 2, counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_dynamic_descriptor_fails_closed(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             GLOBAL_DICT = {"used": 1, "noise": [0]}
@@ -2394,6 +2855,9 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 GLOBAL_DICT["noise"] = [i]
                 torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
             assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert not entries[0]._debug_fast_guard_enabled
 
             descriptor.fail_next = True
             GLOBAL_DICT["noise"] = [100]
