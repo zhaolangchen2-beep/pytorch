@@ -3506,6 +3506,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
     def test_actual_partial_generic_dict_binding_proof(self):
         script = """
             import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
             from torch._dynamo.testing import CompileCounter
 
             GLOBAL_DICT = {"used": 1, "noise": [0]}
@@ -3513,6 +3514,55 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             class Holder:
                 def __init__(self):
                     self.scale = torch.ones(2)
+                    self.enabled = True
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.holder = Holder()
+
+                def forward(self, x):
+                    value = (
+                        self.holder.__dict__["scale"]
+                        + x
+                        + GLOBAL_DICT["used"]
+                    )
+                    return value if self.holder.__dict__["enabled"] else value + 10
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(model, backend=counter, fullgraph=True)
+            x = torch.zeros(2)
+            for i in range(8):
+                GLOBAL_DICT["noise"] = [i]
+                torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            scale = model.holder.scale
+            model.holder.__dict__ = {"scale": scale, "enabled": False}
+            GLOBAL_DICT["noise"] = [100]
+            torch.testing.assert_close(compiled(x), torch.full((2,), 12.0))
+            assert counter.frame_count == 2, counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_generic_dict_owner_type_change(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            GLOBAL_DICT = {"used": 1, "noise": [0]}
+
+            class Holder:
+                def __init__(self):
+                    self.scale = torch.ones(2)
+
+            class ReplacementHolder:
+                pass
 
             class Model(torch.nn.Module):
                 def __init__(self):
@@ -3534,10 +3584,28 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 GLOBAL_DICT["noise"] = [i]
                 torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
             assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
 
-            model.holder.__dict__ = dict(model.holder.__dict__)
+            model.holder.__class__ = ReplacementHolder
+            model.holder.__class__ = Holder
+            GLOBAL_DICT["noise"] = [99]
+            torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 1, counter.frame_count
+            entries = _debug_get_cache_entry_list(Model.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            assert entries[0]._debug_fast_guard_enabled
+
+            model.holder.__class__ = ReplacementHolder
             GLOBAL_DICT["noise"] = [100]
             torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 2, counter.frame_count
+
+            model.holder.__class__ = Holder
+            GLOBAL_DICT["noise"] = [101]
+            torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 2, counter.frame_count
         """
         self._run_fast_plan_script(script)
 
