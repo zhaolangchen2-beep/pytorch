@@ -1521,7 +1521,7 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
 )
 class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
     @staticmethod
-    def _run_fast_plan_script(script):
+    def _run_fast_plan_script(script, timeout=None):
         env = os.environ.copy()
         env["TORCHDYNAMO_GUARD_FAST_PLAN"] = "1"
         subprocess.run(
@@ -1529,6 +1529,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             cwd=os.getcwd(),
             env=env,
             check=True,
+            timeout=timeout,
         )
 
     def test_actual_partial_preserves_module_and_residual_guards(self):
@@ -1883,6 +1884,68 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             assert FINALIZER_STATES == [False], FINALIZER_STATES
         """
         self._run_fast_plan_script(script)
+
+    def test_actual_partial_miss_reset_allows_finalizer_reentry(self):
+        script = """
+            import gc
+            import weakref
+
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            ENTRY = None
+            FINALIZER_ERRORS = []
+            FINALIZER_STATES = []
+            REENTRANT_RESULTS = []
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._cached_tensor = torch.ones(2)
+
+                def forward(self, x):
+                    return self._cached_tensor + x
+
+            model = Model()
+            counter = CompileCounter()
+            compiled = torch.compile(
+                model, backend=counter, fullgraph=True, dynamic=True
+            )
+            x = torch.zeros(2)
+            for _ in range(8):
+                torch.testing.assert_close(compiled(x), torch.ones(2))
+            assert counter.frame_count == 1, counter.frame_count
+
+            ENTRY = _debug_get_cache_entry_list(Model.forward.__code__)[0]
+            assert ENTRY._debug_fast_guard_enabled
+
+            def on_finalize():
+                try:
+                    FINALIZER_STATES.append(ENTRY._debug_fast_guard_enabled)
+                    REENTRANT_RESULTS.append(
+                        ENTRY.guard_manager.check({"self": model, "x": x})
+                    )
+                except BaseException as exc:
+                    FINALIZER_ERRORS.append(repr(exc))
+
+            old_tensor = model._cached_tensor
+            finalizer = weakref.finalize(old_tensor, on_finalize)
+            model._cached_tensor = torch.ones(2)
+            del old_tensor
+            gc.collect()
+            assert finalizer.alive
+
+            torch.testing.assert_close(compiled(x), torch.ones(2))
+            gc.collect()
+            assert not finalizer.alive
+            assert FINALIZER_ERRORS == [], FINALIZER_ERRORS
+            assert FINALIZER_STATES == [False], FINALIZER_STATES
+            assert REENTRANT_RESULTS == [True], REENTRANT_RESULTS
+            assert counter.frame_count == 1, counter.frame_count
+            assert not ENTRY._debug_fast_guard_enabled
+        """
+        self._run_fast_plan_script(script, timeout=30)
 
     def test_actual_partial_cache_reset_detaches_receipt(self):
         script = """
@@ -2426,7 +2489,7 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
-    def test_actual_partial_token_miss_runs_root_guards_once(self):
+    def test_actual_partial_token_miss_retrains_after_single_fallback(self):
         script = """
             import torch
             import torch._dynamo.guards as dynamo_guards
@@ -2468,13 +2531,36 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
 
             entries = _debug_get_cache_entry_list(Model.forward.__code__)
             assert len(entries) == 1, len(entries)
-            assert entries[0]._debug_fast_guard_enabled
+            entry = entries[0]
+            assert entry._debug_fast_guard_enabled
 
             ROOT_GUARD_CALLS = 0
             model.values = [1.0]
             torch.testing.assert_close(compiled(x), torch.ones(2))
             assert counter.frame_count == 1, counter.frame_count
             assert ROOT_GUARD_CALLS == 1, ROOT_GUARD_CALLS
+            assert not entry._debug_fast_guard_enabled
+
+            # A successful full fallback resets the stale plan. Three stable
+            # training passes should enable it again without recompiling or
+            # evaluating the root twice in any lookup.
+            for expected_enabled in (False, False, True):
+                ROOT_GUARD_CALLS = 0
+                torch.testing.assert_close(compiled(x), torch.ones(2))
+                assert counter.frame_count == 1, counter.frame_count
+                assert ROOT_GUARD_CALLS == 1, ROOT_GUARD_CALLS
+                assert (
+                    entry._debug_fast_guard_enabled is expected_enabled
+                ), entry._debug_fast_guard_enabled
+
+            # The old entry's full fallback rejects this input. Its plan must
+            # remain enabled because a future input may still match it.
+            ROOT_GUARD_CALLS = 0
+            model.values = [2.0]
+            torch.testing.assert_close(compiled(x), torch.full((2,), 2.0))
+            assert counter.frame_count == 2, counter.frame_count
+            assert ROOT_GUARD_CALLS == 1, ROOT_GUARD_CALLS
+            assert entry._debug_fast_guard_enabled
         """
         self._run_fast_plan_script(script)
 

@@ -2348,6 +2348,13 @@ struct GuardLastSuccessPartialPlanBuild
   std::vector<GuardSubtreeEntryToken> stability_tokens;
 };
 
+enum class GuardActualPartialCheckStatus : uint8_t {
+  NotAttempted,
+  Hit,
+  Miss,
+  Invalid,
+};
+
 struct GuardLastSuccessPartialPlan : GuardLastSuccessPartialPlanPayload {
   GuardLastSuccessPartialPlanState state{
       GuardLastSuccessPartialPlanState::Training};
@@ -6117,7 +6124,8 @@ class RootGuardManager : public GuardManager {
       T* value,
       const std::string* skip_accessor_source = nullptr,
       GuardLastSuccessPartialPlan* actual_partial_plan = nullptr,
-      bool* actual_partial_plan_invalid = nullptr) { // borrowed ref
+      GuardActualPartialCheckStatus* actual_partial_status = nullptr) {
+    // value is a borrowed reference.
     // Check [Note on GIL interaction with mutex lock] for details on why we
     // need mutex and its interactions with GIL.
     std::unique_lock<std::mutex> lock_guard(_lock, std::defer_lock);
@@ -6139,11 +6147,11 @@ class RootGuardManager : public GuardManager {
 
     if constexpr (HasActualPartial) {
       if (actual_partial_plan == nullptr ||
-          actual_partial_plan_invalid == nullptr ||
+          actual_partial_status == nullptr ||
           skip_accessor_source == nullptr) {
         return false;
       }
-      *actual_partial_plan_invalid = false;
+      *actual_partial_status = GuardActualPartialCheckStatus::NotAttempted;
     }
 
     if (!GuardManager::check_leaf_guards_nopybind(value)) {
@@ -6167,6 +6175,9 @@ class RootGuardManager : public GuardManager {
     if constexpr (HasActualPartial) {
       use_actual_partial = guard_last_success_actual_partial_tokens_match(
           *actual_partial_plan, value, &_local_state);
+      *actual_partial_status = use_actual_partial
+          ? GuardActualPartialCheckStatus::Hit
+          : GuardActualPartialCheckStatus::Miss;
       if (use_actual_partial) {
         for (const auto& plan :
              actual_partial_plan->cross_slice_relations) {
@@ -6175,7 +6186,7 @@ class RootGuardManager : public GuardManager {
           if (guard == nullptr ||
               !guard->preload_actual_partial_relation(plan)) {
             _reset_relational_guard_state();
-            *actual_partial_plan_invalid = true;
+            *actual_partial_status = GuardActualPartialCheckStatus::Invalid;
             use_actual_partial = false;
             break;
           }
@@ -6212,7 +6223,7 @@ class RootGuardManager : public GuardManager {
               const_cast<void*>(plan.guard));
           if (guard == nullptr ||
               !guard->actual_partial_relation_is_complete(plan)) {
-            *actual_partial_plan_invalid = true;
+            *actual_partial_status = GuardActualPartialCheckStatus::Invalid;
             return false;
           }
         }
@@ -6233,9 +6244,9 @@ class RootGuardManager : public GuardManager {
       FrameLocalsMapping* value,
       const std::string& skip_accessor_source,
       GuardLastSuccessPartialPlan& plan,
-      bool& plan_invalid) {
+      GuardActualPartialCheckStatus& status) {
     return check_nopybind_template<true>(
-        value, &skip_accessor_source, &plan, &plan_invalid);
+        value, &skip_accessor_source, &plan, &status);
   }
 
   // Fast check_verbose function.
@@ -9404,11 +9415,17 @@ bool run_root_guard_manager_with_last_success_receipt(
   static const std::string self_source = "L['self']";
 
   if (plan->is_enabled()) {
-    bool plan_invalid = false;
+    auto status = GuardActualPartialCheckStatus::NotAttempted;
     const bool result = root_mgr->check_nopybind_actual_partial(
-        f_locals, self_source, *plan, plan_invalid);
-    if (plan_invalid) {
-      plan->disable();
+        f_locals, self_source, *plan, status);
+    if (C10_UNLIKELY(status != GuardActualPartialCheckStatus::Hit)) {
+      if (status == GuardActualPartialCheckStatus::Invalid) {
+        plan->disable();
+      } else if (result && status == GuardActualPartialCheckStatus::Miss) {
+        // A valid full fallback accepted the current inputs. Retrain against
+        // that state instead of paying a stale fast-path miss forever.
+        plan->reset();
+      }
     }
     return result;
   }
