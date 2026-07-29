@@ -831,6 +831,17 @@ num_guards_executed=0)
         self.assertFalse(debug_info.result)
         self.assertTrue("Test" in debug_info.verbose_code_parts[0])
 
+    def test_code_manager_rejects_non_function(self):
+        def fn():
+            pass
+
+        root = RootGuardManager()
+        root.code_manager("fn.__code__", fn.__code__, default_mgr_enum)
+        self.assertTrue(root.check(fn))
+        self.assertTrue(root.check_verbose(fn).result)
+        self.assertFalse(root.check(object()))
+        self.assertFalse(root.check_verbose(object()).result)
+
     def test_dict_contains_guard(self):
         root = RootGuardManager()
         foo = {"a": 1, "b": 2}
