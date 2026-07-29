@@ -1654,6 +1654,149 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
+    def test_actual_partial_supports_empty_and_shifted_hot_tokens(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            class ProofOnly(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.bias = 1.0
+
+                def forward(self, x):
+                    return x + self.bias
+
+            proof_model = ProofOnly()
+            proof_counter = CompileCounter()
+            proof_compiled = torch.compile(
+                proof_model, backend=proof_counter, fullgraph=True
+            )
+            x = torch.ones(2)
+            for _ in range(8):
+                torch.testing.assert_close(
+                    proof_compiled(x), torch.full((2,), 2.0)
+                )
+            proof_entries = _debug_get_cache_entry_list(ProofOnly.forward.__code__)
+            assert len(proof_entries) == 1, len(proof_entries)
+            assert proof_entries[0]._debug_fast_guard_enabled
+            torch.testing.assert_close(
+                proof_compiled(x), torch.full((2,), 2.0)
+            )
+            assert proof_entries[0]._debug_fast_guard_enabled
+            assert proof_counter.frame_count == 1, proof_counter.frame_count
+
+            proof_model.bias = 3.0
+            torch.testing.assert_close(
+                proof_compiled(x), torch.full((2,), 4.0)
+            )
+            assert proof_counter.frame_count == 2, proof_counter.frame_count
+
+            class ListFirst(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.values = [1.0]
+
+                def forward(self, x):
+                    return x + self.values[0]
+
+            list_model = ListFirst()
+            list_counter = CompileCounter()
+            list_compiled = torch.compile(
+                list_model, backend=list_counter, fullgraph=True
+            )
+            for _ in range(8):
+                torch.testing.assert_close(
+                    list_compiled(x), torch.full((2,), 2.0)
+                )
+            list_entries = _debug_get_cache_entry_list(ListFirst.forward.__code__)
+            assert len(list_entries) == 1, len(list_entries)
+            assert list_entries[0]._debug_fast_guard_enabled
+            torch.testing.assert_close(
+                list_compiled(x), torch.full((2,), 2.0)
+            )
+            assert list_entries[0]._debug_fast_guard_enabled
+            assert list_counter.frame_count == 1, list_counter.frame_count
+
+            list_model.values[0] = 3.0
+            torch.testing.assert_close(
+                list_compiled(x), torch.full((2,), 4.0)
+            )
+            assert list_counter.frame_count == 2, list_counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_skips_only_the_trained_self_accessor(self):
+        script = """
+            import torch
+            import torch._dynamo.guards as dynamo_guards
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.bias = 1.0
+                    self.sentinel = [object()]
+
+                def forward(self, x):
+                    return x + self.bias
+
+            def inject_shadow_self(guard_wrapper, f_locals, _builder):
+                model = f_locals["self"]
+                shadow = guard_wrapper.root.framelocals_manager(
+                    ("self", 0),
+                    "L['shadow_self']",
+                    model,
+                    dynamo_guards.GuardManagerType.GUARD_MANAGER,
+                )
+                sentinel = shadow.getattr_manager(
+                    "sentinel",
+                    "L['shadow_self'].sentinel",
+                    model.sentinel,
+                    dynamo_guards.GuardManagerType.GUARD_MANAGER,
+                )
+                sentinel.list_getitem_manager(
+                    0,
+                    "L['shadow_self'].sentinel[0]",
+                    model.sentinel[0],
+                    dynamo_guards.GuardManagerType.GUARD_MANAGER,
+                ).add_id_match_guard(
+                    id(model.sentinel[0]), ["shadow sentinel identity"]
+                )
+
+            model = Model()
+            counter = CompileCounter()
+            x = torch.ones(2)
+            old_hook = dynamo_guards.guard_manager_testing_hook_fn
+            dynamo_guards.guard_manager_testing_hook_fn = inject_shadow_self
+            try:
+                compiled = torch.compile(model, backend=counter, fullgraph=True)
+                for _ in range(8):
+                    torch.testing.assert_close(
+                        compiled(x), torch.full((2,), 2.0)
+                    )
+                entries = _debug_get_cache_entry_list(Model.forward.__code__)
+                assert len(entries) == 1, len(entries)
+                assert entries[0]._debug_fast_guard_enabled
+                torch.testing.assert_close(
+                    compiled(x), torch.full((2,), 2.0)
+                )
+                assert entries[0]._debug_fast_guard_enabled
+                assert counter.frame_count == 1, counter.frame_count
+
+                model.sentinel[0] = object()
+                torch.testing.assert_close(
+                    compiled(x), torch.full((2,), 2.0)
+                )
+            finally:
+                dynamo_guards.guard_manager_testing_hook_fn = old_hook
+
+            assert counter.frame_count == 2, counter.frame_count
+        """
+        self._run_fast_plan_script(script)
+
     def test_actual_partial_runtime_gate_rejects_unsupported_paths(self):
         script = """
             import torch
