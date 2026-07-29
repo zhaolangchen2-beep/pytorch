@@ -466,13 +466,15 @@ TensorCheck::TensorCheck(
 // See note in guards.py [Note - On Export Tensor Guards]
 // Logic parallel to here must be maintained in python
 bool TensorCheck::check(const LocalState& state, const at::Tensor& v) {
-  // In terms of a sparse_csr tensor, it does not support strides information
-  c10::SymIntArrayRef sym_strides(std::vector<SymInt>(v.ndimension(), -1));
-  bool does_not_support_stride = v.layout() == c10::kSparseCsr ||
-
-      v.layout() == c10::kSparseCsc || v.layout() == c10::kSparseBsc ||
-      v.layout() == c10::kSparseBsr;
-  if (!does_not_support_stride) {
+  // Sparse compressed tensors do not expose stride information.
+  std::vector<SymInt> unsupported_strides;
+  c10::SymIntArrayRef sym_strides;
+  const bool does_not_support_stride =
+      at::sparse_csr::is_sparse_compressed(v);
+  if (does_not_support_stride) {
+    unsupported_strides.assign(v.ndimension(), -1);
+    sym_strides = unsupported_strides;
+  } else {
     sym_strides = v.sym_strides();
   }
 
@@ -1185,46 +1187,6 @@ static uint64_t get_dict_version_unchecked(PyObject* dict) {
 #endif
 }
 
-static bool tensor_layout_does_not_support_stride(const at::Tensor& tensor) {
-  return tensor.layout() == c10::kSparseCsr ||
-      tensor.layout() == c10::kSparseCsc ||
-      tensor.layout() == c10::kSparseBsc ||
-      tensor.layout() == c10::kSparseBsr;
-}
-
-static bool tensor_strides_match_guard_check(
-    const at::Tensor& tensor,
-    const std::vector<int64_t>& stride_indices,
-    const std::vector<c10::SymInt>& stride_values) {
-  if (stride_indices.size() != stride_values.size()) {
-    return false;
-  }
-  if (stride_indices.empty()) {
-    return true;
-  }
-  if (tensor_layout_does_not_support_stride(tensor)) {
-    const int64_t ndim = tensor.ndimension();
-    const c10::SymInt unsupported_stride(static_cast<int64_t>(-1));
-    for (auto i : c10::irange(stride_indices.size())) {
-      const int64_t index = stride_indices[i];
-      if (index < 0 || index >= ndim ||
-          stride_values[i] != unsupported_stride) {
-        return false;
-      }
-    }
-    return true;
-  }
-  const auto current_strides = tensor.sym_strides();
-  for (auto i : c10::irange(stride_indices.size())) {
-    const int64_t index = stride_indices[i];
-    if (index < 0 || index >= static_cast<int64_t>(current_strides.size()) ||
-        stride_values[i] != current_strides[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 static PyObject* current_device_key() {
   static PyObject* key = PyUnicode_InternFromString("CURRENT_DEVICE");
   return key;
@@ -1339,10 +1301,11 @@ struct GuardSubtreeEntryToken {
   at::ScalarType tensor_dtype{at::ScalarType::Undefined};
   c10::DeviceIndex tensor_device_index{-1};
   bool tensor_requires_grad{false};
-  int64_t tensor_dim{0};
-  std::vector<int64_t> tensor_size_indices;
+  bool tensor_strides_unsupported{false};
+  size_t tensor_dim{0};
+  std::vector<size_t> tensor_size_indices;
   std::vector<c10::SymInt> tensor_size_values;
-  std::vector<int64_t> tensor_stride_indices;
+  std::vector<size_t> tensor_stride_indices;
   std::vector<c10::SymInt> tensor_stride_values;
   const void* relational_guard{nullptr};
   PyObject* bound_method_self{nullptr};
@@ -1403,7 +1366,13 @@ struct GuardSubtreeEntryToken {
     if (Py_TYPE(obj) != tensor_check.pytype) {
       return false;
     }
-    if (!THPVariable_CheckExact(obj) && !THPVariable_Check(obj)) {
+    if (!THPVariable_CheckExact(obj)) {
+      return false;
+    }
+
+    const auto& expected_sizes = tensor_check.sizes();
+    const auto& expected_strides = tensor_check.strides();
+    if (expected_sizes.size() != expected_strides.size()) {
       return false;
     }
 
@@ -1414,15 +1383,17 @@ struct GuardSubtreeEntryToken {
 
     token->object = obj;
 
+    const auto tensor_key_set = tensor.key_set();
     token->type = Py_TYPE(obj);
     token->kind = GuardSubtreeProbeTokenKind::TensorMatch;
-    token->tensor_dispatch_key = state.apply(tensor.key_set()).raw_repr();
+    token->tensor_dispatch_key = state.apply(tensor_key_set).raw_repr();
     token->tensor_dtype = tensor.dtype().toScalarType();
     token->tensor_device_index = tensor.device().index();
     token->tensor_requires_grad = tensor.requires_grad();
-    token->tensor_dim = tensor.ndimension();
+    token->tensor_strides_unsupported =
+        tensor_key_set.has_all(c10::sparse_csr_ks);
+    token->tensor_dim = expected_sizes.size();
 
-    const auto& expected_sizes = tensor_check.sizes();
     token->tensor_size_indices.reserve(expected_sizes.size());
     token->tensor_size_values.reserve(expected_sizes.size());
     for (auto i : c10::irange(expected_sizes.size())) {
@@ -1431,13 +1402,11 @@ struct GuardSubtreeEntryToken {
         // Dynamic dimensions are represented as nullopt by TensorCheck and are
         // deliberately not tokenized. Fast-path tensor tokens must not make a
         // dynamic dimension more static than the original guard.
-        token->tensor_size_indices.push_back(static_cast<int64_t>(i));
-
+        token->tensor_size_indices.push_back(i);
         token->tensor_size_values.push_back(expected_size.value());
       }
     }
 
-    const auto& expected_strides = tensor_check.strides();
     token->tensor_stride_indices.reserve(expected_strides.size());
     token->tensor_stride_values.reserve(expected_strides.size());
     for (auto i : c10::irange(expected_strides.size())) {
@@ -1445,7 +1414,7 @@ struct GuardSubtreeEntryToken {
       if (expected_stride.has_value()) {
         // Same rule as sizes: only original static stride guards become token
         // checks; dynamic stride entries stay unchecked here.
-        token->tensor_stride_indices.push_back(static_cast<int64_t>(i));
+        token->tensor_stride_indices.push_back(i);
         token->tensor_stride_values.push_back(expected_stride.value());
       }
     }
@@ -1507,7 +1476,8 @@ struct GuardSubtreeEntryToken {
     }
 
     const at::Tensor& tensor = THPVariable_Unpack(object);
-    if (state.apply(tensor.key_set()).raw_repr() != tensor_dispatch_key) {
+    const auto tensor_key_set = tensor.key_set();
+    if (state.apply(tensor_key_set).raw_repr() != tensor_dispatch_key) {
       return false;
     }
     if (tensor.dtype().toScalarType() != tensor_dtype) {
@@ -1520,20 +1490,35 @@ struct GuardSubtreeEntryToken {
       return false;
     }
     const auto current_sizes = tensor.sym_sizes();
-    if (current_sizes.size() != static_cast<size_t>(tensor_dim)) {
+    if (current_sizes.size() != tensor_dim) {
       return false;
     }
     for (auto i : c10::irange(tensor_size_indices.size())) {
-      const int64_t index = tensor_size_indices[i];
-      if (index < 0 || index >= static_cast<int64_t>(current_sizes.size()) ||
-          tensor_size_values[i] != current_sizes[index]) {
+      if (tensor_size_values[i] != current_sizes[tensor_size_indices[i]]) {
         return false;
       }
     }
 
-    if (!tensor_strides_match_guard_check(
-            tensor, tensor_stride_indices, tensor_stride_values)) {
-      return false;
+    if (!tensor_stride_indices.empty()) {
+      const bool current_strides_unsupported =
+          tensor_key_set.has_all(c10::sparse_csr_ks);
+      if (current_strides_unsupported != tensor_strides_unsupported) {
+        return false;
+      }
+      // TensorCheck represents every compressed stride as -1, so the matching
+      // category proves the recorded static stride values without reading them.
+      if (!current_strides_unsupported) {
+        const auto current_strides = tensor.sym_strides();
+        if (current_strides.size() != tensor_dim) {
+          return false;
+        }
+        for (auto i : c10::irange(tensor_stride_indices.size())) {
+          if (tensor_stride_values[i] !=
+              current_strides[tensor_stride_indices[i]]) {
+            return false;
+          }
+        }
+      }
     }
     return true;
   }
@@ -1553,9 +1538,10 @@ struct GuardSubtreeEntryToken {
       return false;
     }
     if (kind == GuardSubtreeProbeTokenKind::TensorMatch) {
-      // TensorMatch metadata comes from the immutable TensorCheck attached to
-      // this cache entry. A successful full guard pass already validates it.
-      return true;
+      // The full guard validates TensorCheck metadata. Keep the independently
+      // recorded stride category stable across training passes as well.
+      return tensor_strides_unsupported ==
+          other.tensor_strides_unsupported;
     }
     if (kind == GuardSubtreeProbeTokenKind::NoTensorAliasing ||
         kind == GuardSubtreeProbeTokenKind::ObjectAliasing) {
@@ -6874,8 +6860,10 @@ class TENSOR_MATCH : public LeafGuard {
     return GuardDebugInfo(true, 1);
   }
 
-  bool supports_actual_partial_subtree_memo(PyObject*) const override {
-    return true;
+  bool supports_actual_partial_subtree_memo(
+      PyObject* value) const override {
+    // Tensor tokens read raw C++ metadata that subclasses may override.
+    return THPVariable_CheckExact(value);
   }
   bool emits_actual_partial_subtree_memo_token() const override {
     return true;

@@ -1602,6 +1602,154 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
         """
         self._run_fast_plan_script(script)
 
+    def test_actual_partial_tensor_metadata_and_dynamic_dims(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.register_buffer(
+                        "value", torch.arange(4.0).reshape(2, 2)
+                    )
+
+                def forward(self):
+                    return self.value.sin()
+
+            def change_requires_grad(value):
+                value.requires_grad_(True)
+
+            def change_dtype(value):
+                value.data = value.data.to(torch.float64)
+
+            def change_rank(value):
+                value.data = torch.arange(4.0)
+
+            def change_stride(value):
+                value.transpose_(0, 1)
+
+            def check_metadata_miss(mutate):
+                torch._dynamo.reset()
+                model = Model()
+                counter = CompileCounter()
+                compiled = torch.compile(
+                    model, backend=counter, fullgraph=True, dynamic=False
+                )
+                for _ in range(8):
+                    torch.testing.assert_close(compiled(), model())
+
+                entries = _debug_get_cache_entry_list(Model.forward.__code__)
+                assert len(entries) == 1, len(entries)
+                entry = entries[0]
+                assert entry._debug_fast_guard_enabled
+                torch.testing.assert_close(compiled(), model())
+                assert entry._debug_fast_guard_enabled
+                assert counter.frame_count == 1, counter.frame_count
+
+                object_id = id(model.value)
+                mutate(model.value)
+                assert id(model.value) == object_id
+                torch.testing.assert_close(compiled(), model())
+                assert counter.frame_count == 2, counter.frame_count
+
+            for mutate in (
+                change_requires_grad,
+                change_dtype,
+                change_rank,
+                change_stride,
+            ):
+                check_metadata_miss(mutate)
+
+            torch._dynamo.reset()
+            torch._dynamo.config.force_nn_module_property_static_shapes = False
+
+            class DynamicModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.register_buffer("value", torch.ones(2, 2))
+
+                def forward(self):
+                    return self.value + 1
+
+            model = DynamicModel()
+            torch._dynamo.mark_dynamic(model.value, 0)
+            counter = CompileCounter()
+            compiled = torch.compile(
+                model, backend=counter, fullgraph=True, dynamic=True
+            )
+            for _ in range(8):
+                torch.testing.assert_close(compiled(), model())
+
+            entries = _debug_get_cache_entry_list(DynamicModel.forward.__code__)
+            assert len(entries) == 1, len(entries)
+            entry = entries[0]
+            assert entry._debug_fast_guard_enabled
+            torch.testing.assert_close(compiled(), model())
+            assert entry._debug_fast_guard_enabled
+            assert counter.frame_count == 1, counter.frame_count
+
+            object_id = id(model.value)
+            model.value.resize_(5, 2).fill_(2)
+            assert id(model.value) == object_id
+            torch.testing.assert_close(compiled(), model())
+            assert counter.frame_count == 1, counter.frame_count
+            assert entry._debug_fast_guard_enabled
+        """
+        self._run_fast_plan_script(script)
+
+    def test_actual_partial_tensor_exact_type_policy(self):
+        script = """
+            import torch
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch._dynamo.testing import CompileCounter
+
+            def warm_and_get_entry(model):
+                counter = CompileCounter()
+                compiled = torch.compile(
+                    model, backend=counter, fullgraph=True, dynamic=False
+                )
+                for _ in range(8):
+                    torch.testing.assert_close(compiled(), model())
+                assert counter.frame_count == 1, counter.frame_count
+                entries = _debug_get_cache_entry_list(type(model).forward.__code__)
+                assert len(entries) == 1, len(entries)
+                return entries[0]
+
+            class ParameterModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.value = torch.nn.Parameter(torch.ones(2))
+
+                def forward(self):
+                    return self.value.sin()
+
+            parameter_model = ParameterModel()
+            parameter_entry = warm_and_get_entry(parameter_model)
+            assert parameter_entry._debug_fast_guard_enabled
+
+            torch._dynamo.reset()
+
+            class TensorSubclass(torch.Tensor):
+                pass
+
+            class SubclassModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.register_buffer(
+                        "value", torch.ones(2).as_subclass(TensorSubclass)
+                    )
+
+                def forward(self):
+                    return self.value.sin()
+
+            subclass_model = SubclassModel()
+            subclass_entry = warm_and_get_entry(subclass_model)
+            assert not subclass_entry._debug_fast_guard_enabled
+        """
+        self._run_fast_plan_script(script)
+
     def test_actual_partial_preserves_root_special_guards(self):
         script = """
             import torch
