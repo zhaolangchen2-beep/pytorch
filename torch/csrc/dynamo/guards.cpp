@@ -1266,32 +1266,6 @@ static bool guard_subtree_ensure_type_version(
   return guard_subtree_type_version_is_valid(type);
 }
 
-static bool guard_subtree_refresh_absent_lookup_type_version(
-    PyTypeObject* type,
-    PyObject* lookup_key,
-    unsigned int& version) {
-  if (type == nullptr || lookup_key == nullptr) {
-    return false;
-  }
-  if (_PyType_Lookup(type, lookup_key) != nullptr) {
-    return false;
-  }
-  if (PyErr_Occurred()) {
-    PyErr_Clear();
-    return false;
-  }
-#if PY_VERSION_HEX >= 0x030C0000
-  if (PyUnstable_Type_AssignVersionTag(type) == 0) {
-    return false;
-  }
-#endif
-  if (!guard_subtree_type_version_is_valid(type)) {
-    return false;
-  }
-  version = type->tp_version_tag;
-  return true;
-}
-
 enum class GuardCrossSliceRelationKind : uint8_t {
   ObjectAliasing,
   NoTensorAliasing,
@@ -1786,9 +1760,18 @@ static bool guard_last_success_add_absent_type_binding(
     PyTypeObject* type,
     PyObject* lookup_key,
     std::vector<GuardSubtreeAttrTypeProof>& proofs) {
-  unsigned int version = 0;
-  if (!guard_subtree_refresh_absent_lookup_type_version(
-          type, lookup_key, version)) {
+  if (type == nullptr || lookup_key == nullptr ||
+      _PyType_Lookup(type, lookup_key) != nullptr || PyErr_Occurred()) {
+    PyErr_Clear();
+    return false;
+  }
+#if PY_VERSION_HEX >= 0x030C0000
+  if (PyUnstable_Type_AssignVersionTag(type) == 0) {
+    PyErr_Clear();
+    return false;
+  }
+#endif
+  if (!guard_subtree_type_version_is_valid(type)) {
     PyErr_Clear();
     return false;
   }
@@ -2267,13 +2250,17 @@ struct GuardLastSuccessPartialPlan : GuardLastSuccessPartialPlanPayload {
       next_unstable_passes = 0;
     }
 
+    std::vector<GuardSubtreeEntryToken> next_stability_tokens;
+    if (next_state != GuardLastSuccessPartialPlanState::Enabled) {
+      next_stability_tokens = std::move(build.stability_tokens);
+    }
     state = GuardLastSuccessPartialPlanState::Disabled;
     auto retired_payload = std::exchange(
         static_cast<GuardLastSuccessPartialPlanPayload&>(*this),
         std::move(
             static_cast<GuardLastSuccessPartialPlanPayload&>(build)));
     auto retired_stability_tokens =
-        std::exchange(stability_tokens, std::move(build.stability_tokens));
+        std::exchange(stability_tokens, std::move(next_stability_tokens));
     stable_passes = next_stable_passes;
     unstable_passes = next_unstable_passes;
     state = next_state;
@@ -2285,12 +2272,12 @@ struct GuardLastSuccessPartialPlan : GuardLastSuccessPartialPlanPayload {
 static bool guard_subtree_exact_list_token_matches_current(
     const GuardSubtreeEntryToken& token) {
   PyObject* current_object = token.object;
-  if (current_object == nullptr || !PyList_CheckExact(current_object)) {
-    return false;
-  }
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      current_object != nullptr && PyList_CheckExact(current_object) &&
+      token.size >= 0 &&
+      static_cast<size_t>(token.size) == token.list_items.size());
   const Py_ssize_t size = PyList_GET_SIZE(current_object);
-  if (size != token.size ||
-      static_cast<size_t>(size) != token.list_items.size()) {
+  if (size != token.size) {
     return false;
   }
   for (Py_ssize_t i = 0; i < size; ++i) {
@@ -2314,8 +2301,9 @@ static bool guard_subtree_memo_tokens_match(
     }
     PyObject* current_object = token.object;
     if (token.kind == GuardSubtreeProbeTokenKind::ExactDict) {
-      if (current_object == nullptr || !PyDict_CheckExact(current_object) ||
-          get_dict_version_unchecked(current_object) != token.version ||
+      TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+          current_object != nullptr && PyDict_CheckExact(current_object));
+      if (get_dict_version_unchecked(current_object) != token.version ||
           PyDict_GET_SIZE(current_object) != token.size) {
         return false;
       }
@@ -2355,29 +2343,6 @@ static bool is_self_local_source_path(const std::string& source) {
 static bool is_local_source_path(const std::string& source) {
 
   return source_starts_with(source, "L[");
-}
-
-static PyObject* guard_last_success_self_key() {
-  static PyObject* key = PyUnicode_InternFromString("self");
-
-  return key;
-}
-
-static PyObject* guard_last_success_get_self(
-    FrameLocalsMapping* f_locals,
-    int framelocals_index) {
-  if (framelocals_index >= 0) {
-    PyObject* current_self = f_locals->get(framelocals_index);
-    if (current_self != nullptr) {
-      return current_self;
-    }
-  }
-  PyObject* key = guard_last_success_self_key();
-  if (key == nullptr) {
-    PyErr_Clear();
-    return nullptr;
-  }
-  return PyDict_GetItem((PyObject*)f_locals->to_dict(), key);
 }
 
 static bool guard_last_success_extract_self_partial_tokens(
@@ -2433,12 +2398,8 @@ static bool guard_last_success_prepare_actual_partial(
           tokens, debug_paths, partial_tokens)) {
     return false;
   }
-  if (partial_tokens.size() > kGuardLastSuccessActualMaxTokens) {
-    return false;
-  }
 
-  PyObject* current_self =
-      guard_last_success_get_self(f_locals, self_framelocals_index);
+  PyObject* current_self = f_locals->get(self_framelocals_index);
   if (current_self == nullptr || self_accessor == nullptr) {
     return false;
   }
@@ -2517,8 +2478,7 @@ static bool guard_last_success_actual_partial_tokens_match(
     GuardLastSuccessPartialPlan& plan,
     FrameLocalsMapping* f_locals,
     const LocalState& local_state) {
-  PyObject* current_self =
-      guard_last_success_get_self(f_locals, plan.self_framelocals_index);
+  PyObject* current_self = f_locals->get(plan.self_framelocals_index);
   if (current_self == nullptr || plan.self_weakref.ptr() == nullptr ||
       Py_TYPE(current_self) != plan.self_type) {
     return false;
@@ -5951,8 +5911,10 @@ class RootGuardManager : public GuardManager {
     auto relational_guard_state_reset =
         c10::make_scope_exit([this]() { _reset_relational_guard_state(); });
 
-    // Clean up dict pointer recording for tag safe roots
-    reset_dict_tag_recording_variables();
+    // Clean up dict pointer recording left by an interrupted evaluation.
+    if (C10_UNLIKELY(_is_recording_dict_pointers)) {
+      reset_dict_tag_recording_variables();
+    }
 
     // Get the local state. This will be used for TENSOR_MATCH guards.
     if (_init_local_state) {

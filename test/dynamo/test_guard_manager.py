@@ -1964,9 +1964,10 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
                 def forward(self, x):
                     return x + self.state["bias"]
 
+            control_model = Control()
             control_counter = CompileCounter()
             control = torch.compile(
-                Control(), backend=control_counter, fullgraph=True
+                control_model, backend=control_counter, fullgraph=True
             )
             x = torch.ones(2)
             for _ in range(8):
@@ -1974,6 +1975,9 @@ class GuardActualPartialFastPathTests(torch._dynamo.test_case.TestCase):
             control_entries = _debug_get_cache_entry_list(Control.forward.__code__)
             assert len(control_entries) == 1, len(control_entries)
             assert control_entries[0]._debug_fast_guard_enabled
+            control_model.state["bias"] = 3.0
+            torch.testing.assert_close(control(x), torch.full((2,), 4.0))
+            assert control_counter.frame_count == 2, control_counter.frame_count
 
             class Model(torch.nn.Module):
                 def __init__(self):
